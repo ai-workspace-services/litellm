@@ -1,6 +1,6 @@
 "use client";
 
-import React, { Suspense, useState } from "react";
+import React, { Suspense, useEffect, useState } from "react";
 import Navbar from "@/components/navbar";
 import LoadingScreen from "@/components/common_components/LoadingScreen";
 import { ThemeProvider } from "@/contexts/ThemeContext";
@@ -9,6 +9,7 @@ import SidebarProvider from "@/app/(dashboard)/components/SidebarProvider";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import { DebugWarningBanner } from "@/components/DebugWarningBanner";
 import { MIGRATED_PAGES, migratedHref, legacyPageHref, legacyKeyForPathname } from "@/utils/migratedPages";
+import { isMITDisabledUIPage, MIT_FALLBACK_UI_PAGE } from "@/utils/mitDisabledPages";
 
 function DashboardShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -20,9 +21,19 @@ function DashboardShell({ children }: { children: React.ReactNode }) {
   const page = legacyKeyForPathname(pathname) || searchParams.get("page") || "api-keys";
 
   const navigateToPage = (newPage: string) => {
+    if (isMITDisabledUIPage(newPage)) {
+      router.push(legacyPageHref(MIT_FALLBACK_UI_PAGE));
+      return;
+    }
     const migratedRoute = MIGRATED_PAGES[newPage];
     router.push(migratedRoute ? migratedHref(migratedRoute) : legacyPageHref(newPage));
   };
+
+  useEffect(() => {
+    if (isMITDisabledUIPage(page)) {
+      router.replace(legacyPageHref(MIT_FALLBACK_UI_PAGE));
+    }
+  }, [page, router]);
 
   return (
     <div className="flex flex-col min-h-screen">
