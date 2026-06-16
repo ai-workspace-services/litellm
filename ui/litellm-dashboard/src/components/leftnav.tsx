@@ -44,6 +44,7 @@ import NewBadge from "./common_components/NewBadge";
 import type { Organization } from "./networking";
 import UsageIndicator from "./UsageIndicator";
 import { MIGRATED_PAGES, migratedHref, legacyPageHref } from "@/utils/migratedPages";
+import { isMITDisabledUIPage } from "@/utils/mitDisabledPages";
 const { Sider } = Layout;
 
 // Define the props type
@@ -492,6 +493,8 @@ const Sidebar: React.FC<SidebarProps> = ({
 
         // Hide Projects page if enableProjectsUI is not enabled
         if (item.key === "projects" && !enableProjectsUI) return false;
+
+        if (isMITDisabledUIPage(item.page)) return false;
 
         // Hide agents and vector-stores pages for non-admin users when disabled,
         // unless allow_*_for_team_admins is on and the user is a team admin.
