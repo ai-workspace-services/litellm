@@ -1,0 +1,187 @@
+name: Build LiteLLM Runtime & Offline Package
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - litellm/**
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/offline-package-litellm-runtime.yaml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Offline release tag. Leave empty to use runtime-<sha>"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: litellm-runtime-and-offline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.distro }}-${{ matrix.version }}-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            version: "13"
+            arch: amd64
+          - distro: debian
+            version: "13"
+            arch: arm64
+          - distro: debian
+            version: "12"
+            arch: amd64
+          - distro: debian
+            version: "12"
+            arch: arm64
+          - distro: debian
+            version: "11"
+            arch: amd64
+          - distro: debian
+            version: "11"
+            arch: arm64
+          - distro: ubuntu
+            version: "26.04"
+            arch: amd64
+          - distro: ubuntu
+            version: "26.04"
+            arch: arm64
+          - distro: ubuntu
+            version: "24.04"
+            arch: amd64
+          - distro: ubuntu
+            version: "24.04"
+            arch: arm64
+          - distro: ubuntu
+            version: "22.04"
+            arch: amd64
+          - distro: ubuntu
+            version: "22.04"
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable QEMU for cross-arch package collection
+        uses: docker/setup-qemu-action@v3
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y curl jq python3-pip
+
+      - name: Build runtime package
+        env:
+          TARGET_DISTRO: ${{ matrix.distro }}
+          TARGET_VERSION: ${{ matrix.version }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          LITELLM_VERSION: "1.89.0"
+          LITELLM_DEBIAN_11_VERSION: "1.74.9"
+          UV_VERSION: "0.11.21"
+          PORTABLE_PYTHON_VERSION: "3.13.14"
+        run: |
+          set -euo pipefail
+          root="${PWD}/dist/runtime/litellm-runtime"
+          mkdir -p "${root}/packages/pip" "${root}/packages/python" \
+            "${root}/metadata" dist/assets
+          image="${TARGET_DISTRO}:${TARGET_VERSION}"
+          docker run --rm --platform "linux/${TARGET_ARCH}" \
+            -e TARGET_DISTRO -e TARGET_VERSION -e TARGET_ARCH \
+            -e LITELLM_VERSION -e LITELLM_DEBIAN_11_VERSION \
+            -e UV_VERSION -e PORTABLE_PYTHON_VERSION \
+            -v "${PWD}:/src:ro" \
+            -v "${root}:/out" \
+            "${image}" bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                ca-certificates curl build-essential libpq-dev \
+                python3 python3-dev python3-pip python3-venv
+              python_bin=python3
+              if [ "${TARGET_DISTRO}:${TARGET_VERSION}" = "ubuntu:26.04" ]; then
+                case "${TARGET_ARCH}" in amd64) uv_arch=x86_64 ;; arm64) uv_arch=aarch64 ;; esac
+                curl -fsSL \
+                  "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${uv_arch}-unknown-linux-gnu.tar.gz" \
+                  -o /tmp/uv.tar.gz
+                tar -xzf /tmp/uv.tar.gz -C /tmp
+                install -m 0755 "$(find /tmp -type f -path "*/uv-*/uv" -print -quit)" /usr/local/bin/uv
+                uv python install "${PORTABLE_PYTHON_VERSION}" --install-dir /out/packages/python --no-bin
+                python_bin="$(find -L /out/packages/python -type f -path "*/bin/python3.13" -perm /111 -print -quit)"
+                find /out/packages/python -name EXTERNALLY-MANAGED -delete
+                "${python_bin}" -m ensurepip --upgrade
+              fi
+              "${python_bin}" -m venv /tmp/wheel-builder
+              /tmp/wheel-builder/bin/pip install --upgrade pip setuptools wheel
+              package_spec="/src[proxy]"
+              runtime_spec="litellm[proxy]==${LITELLM_VERSION}"
+              if [ "${TARGET_DISTRO}:${TARGET_VERSION}" = "debian:11" ]; then
+                package_spec="litellm[proxy]==${LITELLM_DEBIAN_11_VERSION}"
+                runtime_spec="${package_spec}"
+              fi
+              /tmp/wheel-builder/bin/pip wheel --wheel-dir /out/packages/pip \
+                "${package_spec}" prisma psycopg2-binary
+              printf "LITELLM_PACKAGE_SPEC=%s\n" "${runtime_spec}" > /out/metadata/runtime.env
+            '
+          cat > "${root}/manifest.json" <<JSON
+          {
+            "component": "litellm",
+            "commit": "${GITHUB_SHA}",
+            "distro": "${TARGET_DISTRO}",
+            "version": "${TARGET_VERSION}",
+            "arch": "${TARGET_ARCH}"
+          }
+          JSON
+          asset="litellm-runtime-${TARGET_DISTRO}-${TARGET_VERSION}-${TARGET_ARCH}.tar.gz"
+          tar -czf "dist/assets/${asset}" -C dist/runtime litellm-runtime
+          (
+            cd dist/assets
+            sha256sum -- "./${asset}" | sed 's# \./# #' > \
+              "SHA256SUMS-${TARGET_DISTRO}-${TARGET_VERSION}-${TARGET_ARCH}"
+          )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: litellm-runtime-${{ matrix.distro }}-${{ matrix.version }}-${{ matrix.arch }}
+          path: |
+            dist/assets/*.tar.gz
+            dist/assets/SHA256SUMS-*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: litellm-runtime-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish runtime release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:-runtime-${GITHUB_SHA::12}}"
+          cat dist/SHA256SUMS-* | sort -u > dist/SHA256SUMS
+          rm -f dist/SHA256SUMS-*
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/*.tar.gz dist/SHA256SUMS \
+              --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${tag}" dist/*.tar.gz dist/SHA256SUMS \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "LiteLLM runtime ${GITHUB_SHA::12}" \
+              --notes "Prebuilt wheelhouses for maintained Debian and Ubuntu targets."
+          fi
